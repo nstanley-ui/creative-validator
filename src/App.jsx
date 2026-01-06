@@ -1,96 +1,97 @@
 import React, { useState } from 'react';
-import { PLATFORMS, AD_TYPES, getPlatformsByAdType } from './platformSpecs';
-import { validateCreative, groupBySeverity, SEVERITY } from './validator';
-import { detectPlatforms, getPlatformName, formatConfidence, getConfidenceColor } from './autoDetection';
+import { validateCreative } from './validator';
+import { detectPlatforms, getPlatformName } from './autoDetection';
+import { createDemoFiles } from './demoCreatives';
 import './App.css';
 
 function App() {
-  const [selectedAdTypes, setSelectedAdTypes] = useState([]);
-  const [selectedPlatforms, setSelectedPlatforms] = useState([]);
-  const [files, setFiles] = useState([]);
-  const [filesWithMetadata, setFilesWithMetadata] = useState([]);
-  const [autoDetections, setAutoDetections] = useState([]);
   const [validationResults, setValidationResults] = useState([]);
-  const [isValidating, setIsValidating] = useState(false);
-  const [isAnalyzing, setIsAnalyzing] = useState(false);
-  const [expandedSections, setExpandedSections] = useState({
-    errors: true,
-    warnings: false,
-    success: false
-  });
-  const [expandedPlatforms, setExpandedPlatforms] = useState({});
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [expandedFiles, setExpandedFiles] = useState({});
+  const [showDemoModal, setShowDemoModal] = useState(false);
 
-  // Get platforms filtered by selected ad types
-  const availablePlatforms = selectedAdTypes.length > 0
-    ? Object.entries(PLATFORMS)
-        .filter(([_, platform]) => 
-          platform.adTypes.some(type => selectedAdTypes.includes(type))
-        )
-        .map(([id, platform]) => ({ id, ...platform }))
-    : Object.entries(PLATFORMS).map(([id, platform]) => ({ id, ...platform }));
-
-  const handleAdTypeToggle = (adType) => {
-    setSelectedAdTypes(prev => 
-      prev.includes(adType)
-        ? prev.filter(t => t !== adType)
-        : [...prev, adType]
-    );
-    // Reset platform selection when ad types change
-    setSelectedPlatforms([]);
-  };
-
-  const handlePlatformToggle = (platformId) => {
-    setSelectedPlatforms(prev =>
-      prev.includes(platformId)
-        ? prev.filter(id => id !== platformId)
-        : [...prev, platformId]
-    );
-  };
-
-  const handleFileChange = async (event) => {
+  // Process files: detect + validate
+  const handleFileUpload = async (event) => {
     const selectedFiles = Array.from(event.target.files);
-    setFiles(selectedFiles);
-    setIsAnalyzing(true);
+    await processFiles(selectedFiles);
+  };
 
-    // Extract metadata and run auto-detection for each file
-    const filesData = [];
-    const allDetections = [];
+  const processFiles = async (files) => {
+    setIsProcessing(true);
+    setValidationResults([]);
 
-    for (const file of selectedFiles) {
+    const results = [];
+
+    for (const file of files) {
+      // Extract metadata
       const metadata = await extractMetadata(file);
-      filesData.push({ file, metadata });
       
+      // Auto-detect platforms
       const detections = detectPlatforms(file, metadata);
-      allDetections.push({
+      const platformsToValidate = detections
+        .filter(d => d.confidence >= 0.75)
+        .map(d => d.platform);
+
+      // Validate against detected platforms
+      const validation = await validateCreative(file, platformsToValidate);
+      
+      // Categorize by readiness
+      const readyFor = [];
+      const issuesFor = [];
+
+      validation.platforms.forEach(result => {
+        const hasErrors = result.issues.some(i => i.severity === 'error');
+        if (!hasErrors) {
+          readyFor.push({
+            platform: result.platformName,
+            issues: result.issues.filter(i => i.severity === 'warning')
+          });
+        } else {
+          issuesFor.push({
+            platform: result.platformName,
+            issues: result.issues
+          });
+        }
+      });
+
+      results.push({
         filename: file.name,
-        detections
+        fileSize: (file.size / 1024).toFixed(0) + 'KB',
+        dimensions: metadata.width && metadata.height 
+          ? `${metadata.width}x${metadata.height}`
+          : null,
+        duration: metadata.duration ? `${metadata.duration}s` : null,
+        detections,
+        readyFor,
+        issuesFor,
+        allPlatforms: validation.platforms
       });
     }
 
-    setFilesWithMetadata(filesData);
-    setAutoDetections(allDetections);
-    setIsAnalyzing(false);
+    setValidationResults(results);
+    setIsProcessing(false);
   };
 
   // Extract metadata from file
   const extractMetadata = async (file) => {
+    // Check if it's a demo file with pre-attached metadata
+    if (file.__demoMetadata) {
+      return file.__demoMetadata;
+    }
+
     const ext = file.name.split('.').pop().toLowerCase();
     
-    // Image metadata
     if (['jpg', 'jpeg', 'png', 'gif'].includes(ext)) {
       try {
-        const dimensions = await getImageDimensions(file);
-        return dimensions;
+        return await getImageDimensions(file);
       } catch (error) {
         return {};
       }
     }
     
-    // Video metadata
     if (['mp4', 'mov'].includes(ext)) {
       try {
-        const metadata = await getVideoMetadata(file);
-        return metadata;
+        return await getVideoMetadata(file);
       } catch (error) {
         return {};
       }
@@ -99,7 +100,6 @@ function App() {
     return {};
   };
 
-  // Get image dimensions
   const getImageDimensions = (file) => {
     return new Promise((resolve, reject) => {
       const img = new Image();
@@ -119,7 +119,6 @@ function App() {
     });
   };
 
-  // Get video metadata
   const getVideoMetadata = (file) => {
     return new Promise((resolve, reject) => {
       const video = document.createElement('video');
@@ -143,95 +142,18 @@ function App() {
     });
   };
 
-  // Apply auto-detected platforms
-  const applyAutoDetections = () => {
-    const suggestedPlatforms = new Set();
-    
-    autoDetections.forEach(fileDetection => {
-      fileDetection.detections.forEach(detection => {
-        if (detection.autoSelect && detection.confidence >= 0.75) {
-          suggestedPlatforms.add(detection.platform);
-        }
-      });
-    });
-    
-    setSelectedPlatforms(Array.from(suggestedPlatforms));
-  };
-
-  const handleValidate = async () => {
-    if (files.length === 0 || selectedPlatforms.length === 0) {
-      alert('Please select files and at least one platform');
-      return;
-    }
-
-    setIsValidating(true);
-    setValidationResults([]);
-
-    const results = [];
-    for (const file of files) {
-      const result = await validateCreative(file, selectedPlatforms);
-      results.push(result);
-    }
-
-    setValidationResults(results);
-    setIsValidating(false);
-    
-    // Expand errors by default
-    setExpandedSections({ errors: true, warnings: false, success: false });
-  };
-
-  const toggleSection = (section) => {
-    setExpandedSections(prev => ({
+  const toggleFileExpand = (filename) => {
+    setExpandedFiles(prev => ({
       ...prev,
-      [section]: !prev[section]
+      [filename]: !prev[filename]
     }));
   };
 
-  const togglePlatform = (fileIndex, platformId) => {
-    const key = `${fileIndex}-${platformId}`;
-    setExpandedPlatforms(prev => ({
-      ...prev,
-      [key]: !prev[key]
-    }));
+  const loadDemoFiles = async () => {
+    const demoFiles = createDemoFiles();
+    await processFiles(demoFiles);
+    setShowDemoModal(false);
   };
-
-  const selectAllAdTypes = () => {
-    setSelectedAdTypes(Object.values(AD_TYPES));
-  };
-
-  const clearAdTypes = () => {
-    setSelectedAdTypes([]);
-    setSelectedPlatforms([]);
-  };
-
-  const selectAllPlatforms = () => {
-    setSelectedPlatforms(availablePlatforms.map(p => p.id));
-  };
-
-  const clearPlatforms = () => {
-    setSelectedPlatforms([]);
-  };
-
-  // Group all results by severity
-  const allGrouped = {
-    errors: [],
-    warnings: [],
-    success: []
-  };
-
-  validationResults.forEach((result, fileIndex) => {
-    const grouped = groupBySeverity(result);
-    
-    grouped.errors.forEach(platform => {
-      allGrouped.errors.push({ ...platform, fileIndex, filename: result.filename });
-    });
-    grouped.warnings.forEach(platform => {
-      allGrouped.warnings.push({ ...platform, fileIndex, filename: result.filename });
-    });
-    grouped.success.forEach(platform => {
-      allGrouped.success.push({ ...platform, fileIndex, filename: result.filename });
-    });
-  });
 
   return (
     <div className="app">
@@ -242,173 +164,171 @@ function App() {
           Creative Validator
         </h1>
         <p className="subtitle">
-          Multi-platform ad creative validation
+          AI-powered multi-platform validation
         </p>
       </div>
 
-      {/* Ad Type Selection */}
-      <div className="selection-section">
-        <div className="section-header">
-          <h2>1. Select Ad Type(s)</h2>
-          <div className="quick-actions">
-            <button onClick={selectAllAdTypes} className="quick-btn">Select All</button>
-            <button onClick={clearAdTypes} className="quick-btn">Clear</button>
-          </div>
-        </div>
-        <div className="checkbox-grid">
-          {Object.values(AD_TYPES).map(adType => (
-            <label key={adType} className="checkbox-item">
-              <input
-                type="checkbox"
-                checked={selectedAdTypes.includes(adType)}
-                onChange={() => handleAdTypeToggle(adType)}
-              />
-              <span>{adType}</span>
-            </label>
-          ))}
-        </div>
-      </div>
-
-      {/* Platform Selection */}
-      <div className="selection-section">
-        <div className="section-header">
-          <h2>2. Select Platform(s)</h2>
-          <div className="quick-actions">
-            <button onClick={selectAllPlatforms} className="quick-btn" disabled={availablePlatforms.length === 0}>
-              Select All {availablePlatforms.length > 0 && `(${availablePlatforms.length})`}
-            </button>
-            <button onClick={clearPlatforms} className="quick-btn">Clear</button>
-          </div>
-        </div>
-        {selectedAdTypes.length === 0 && (
-          <p className="helper-text">💡 Select ad type(s) above to filter platforms</p>
-        )}
-        <div className="checkbox-grid">
-          {availablePlatforms.map(platform => (
-            <label key={platform.id} className="checkbox-item platform-item">
-              <input
-                type="checkbox"
-                checked={selectedPlatforms.includes(platform.id)}
-                onChange={() => handlePlatformToggle(platform.id)}
-              />
-              <div>
-                <span className="platform-name">{platform.name}</span>
-                <span className="platform-desc">{platform.description}</span>
-              </div>
-            </label>
-          ))}
-        </div>
-        {availablePlatforms.length === 0 && selectedAdTypes.length > 0 && (
-          <p className="no-platforms">No platforms support the selected ad types</p>
-        )}
-      </div>
-
-      {/* File Upload */}
-      <div className="upload-section">
-        <h2>3. Upload Creative(s)</h2>
-        <label className="file-upload-label">
+      {/* Upload Section - TOP OF PAGE */}
+      <div className="upload-hero">
+        <label className="file-upload-hero-label">
           <input
             type="file"
             multiple
-            onChange={handleFileChange}
+            onChange={handleFileUpload}
             accept=".zip,.html,.jpg,.jpeg,.png,.gif,.mp4,.mov,.pdf"
             style={{ display: 'none' }}
           />
-          <div className="file-upload-box">
-            <span className="upload-icon">📁</span>
-            <span className="upload-text">
-              {files.length === 0
-                ? 'Click to select files or drag and drop'
-                : `${files.length} file(s) selected`}
-            </span>
-            {files.length > 0 && (
-              <div className="file-list">
-                {files.map((file, index) => (
-                  <div key={index} className="file-item">
-                    {file.name} ({(file.size / 1024).toFixed(0)}KB)
-                  </div>
-                ))}
-              </div>
-            )}
+          <div className="file-upload-hero-box">
+            <div className="upload-hero-icon">📤</div>
+            <h2 className="upload-hero-title">Drop files here or click to upload</h2>
+            <p className="upload-hero-subtitle">
+              AI will auto-detect platforms and validate instantly
+            </p>
+            <div className="upload-hero-formats">
+              Supports: HTML5, Images, Videos, PDFs
+            </div>
           </div>
         </label>
+
+        <button onClick={() => setShowDemoModal(true)} className="demo-btn">
+          🎭 Try Demo Files
+        </button>
       </div>
 
-      {/* Auto-Detection Results */}
-      {autoDetections.length > 0 && (
-        <div className="auto-detection-section">
-          <div className="section-header">
-            <h2>
-              <span className="brain-icon">🧠</span>
-              Smart Platform Detection
-            </h2>
-            <button 
-              onClick={applyAutoDetections} 
-              className="apply-auto-btn"
-            >
-              Auto-Select All
-            </button>
+      {/* Processing Indicator */}
+      {isProcessing && (
+        <div className="processing-section">
+          <div className="processing-spinner"></div>
+          <div className="processing-text">
+            🧠 Analyzing files and detecting platforms...
+          </div>
+        </div>
+      )}
+
+      {/* Compact Results */}
+      {validationResults.length > 0 && !isProcessing && (
+        <div className="results-compact">
+          <div className="results-header">
+            <h2>Validation Results</h2>
+            <div className="results-stats">
+              {validationResults.length} file(s) analyzed
+            </div>
           </div>
 
-          {isAnalyzing && (
-            <div className="analyzing-message">
-              Analyzing files...
-            </div>
-          )}
+          {validationResults.map((result, index) => (
+            <div key={index} className="result-card-compact">
+              {/* Compact Header */}
+              <div 
+                className="result-compact-header"
+                onClick={() => toggleFileExpand(result.filename)}
+              >
+                <div className="result-compact-info">
+                  <div className="result-compact-filename">
+                    {result.filename}
+                  </div>
+                  <div className="result-compact-meta">
+                    {result.fileSize}
+                    {result.dimensions && ` • ${result.dimensions}`}
+                    {result.duration && ` • ${result.duration}`}
+                  </div>
+                </div>
 
-          {!isAnalyzing && autoDetections.map((fileDetection, fileIndex) => (
-            <div key={fileIndex} className="detection-file-card">
-              <div className="detection-file-header">
-                <span className="detection-filename">{fileDetection.filename}</span>
-                {filesWithMetadata[fileIndex]?.metadata.width && (
-                  <span className="detection-metadata">
-                    {filesWithMetadata[fileIndex].metadata.width}x
-                    {filesWithMetadata[fileIndex].metadata.height}
-                    {filesWithMetadata[fileIndex].metadata.duration && 
-                      ` • ${filesWithMetadata[fileIndex].metadata.duration}s`
-                    }
-                  </span>
+                {result.readyFor.length > 0 ? (
+                  <div className="result-compact-status ready">
+                    <span className="status-icon">✓</span>
+                    <span className="status-text">
+                      Ready for: {result.readyFor.map(r => r.platform).join(', ')}
+                    </span>
+                  </div>
+                ) : (
+                  <div className="result-compact-status issues">
+                    <span className="status-icon">⚠</span>
+                    <span className="status-text">
+                      Issues found • {result.issuesFor.length} platform(s)
+                    </span>
+                  </div>
                 )}
+
+                <button className="expand-toggle">
+                  {expandedFiles[result.filename] ? '▲' : '▼'}
+                </button>
               </div>
 
-              {fileDetection.detections.length > 0 ? (
-                <div className="detection-platforms">
-                  {fileDetection.detections.slice(0, 5).map((detection, detIndex) => (
-                    <div 
-                      key={detIndex} 
-                      className={`detection-card ${detection.autoSelect ? 'auto-select' : ''}`}
-                      onClick={() => {
-                        if (!selectedPlatforms.includes(detection.platform)) {
-                          setSelectedPlatforms([...selectedPlatforms, detection.platform]);
-                        }
-                      }}
-                    >
-                      <div className="detection-header">
-                        <span className="detection-platform-name">
-                          {detection.autoSelect && '✓ '}
-                          {getPlatformName(detection.platform)}
-                        </span>
-                        <span 
-                          className="detection-confidence"
-                          style={{ color: getConfidenceColor(detection.confidence) }}
-                        >
-                          {formatConfidence(detection.confidence)}
-                        </span>
-                      </div>
-                      <div className="detection-reason">
-                        {detection.reason}
-                      </div>
-                      {detection.warning && (
-                        <div className="detection-warning">
-                          ⚠️ {detection.warning}
+              {/* Expanded Details */}
+              {expandedFiles[result.filename] && (
+                <div className="result-compact-expanded">
+                  {/* Detection Info */}
+                  <div className="expanded-section">
+                    <h4 className="expanded-section-title">
+                      🧠 AI Detection Results
+                    </h4>
+                    <div className="detection-badges">
+                      {result.detections.slice(0, 5).map((det, i) => (
+                        <div key={i} className="detection-badge">
+                          <span className="badge-platform">{getPlatformName(det.platform)}</span>
+                          <span className="badge-confidence">{Math.round(det.confidence * 100)}%</span>
+                          <span className="badge-reason">{det.reason}</span>
                         </div>
-                      )}
+                      ))}
                     </div>
-                  ))}
-                </div>
-              ) : (
-                <div className="no-detections">
-                  No automatic platform matches. Please select manually.
+                  </div>
+
+                  {/* Ready Platforms */}
+                  {result.readyFor.length > 0 && (
+                    <div className="expanded-section">
+                      <h4 className="expanded-section-title ready-title">
+                        ✓ Ready to Deploy ({result.readyFor.length})
+                      </h4>
+                      <div className="ready-platforms">
+                        {result.readyFor.map((platform, i) => (
+                          <div key={i} className="platform-ready-card">
+                            <div className="platform-ready-name">
+                              {platform.platform}
+                            </div>
+                            {platform.issues.length > 0 && (
+                              <div className="platform-ready-warnings">
+                                {platform.issues.map((issue, j) => (
+                                  <div key={j} className="warning-item">
+                                    ⚠️ {issue.message}
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Issues Platforms */}
+                  {result.issuesFor.length > 0 && (
+                    <div className="expanded-section">
+                      <h4 className="expanded-section-title issues-title">
+                        ⚠ Needs Fixes ({result.issuesFor.length})
+                      </h4>
+                      <div className="issues-platforms">
+                        {result.issuesFor.map((platform, i) => (
+                          <div key={i} className="platform-issues-card">
+                            <div className="platform-issues-name">
+                              {platform.platform}
+                            </div>
+                            <div className="platform-issues-list">
+                              {platform.issues
+                                .filter(issue => issue.severity === 'error')
+                                .map((issue, j) => (
+                                  <div key={j} className="issue-item error">
+                                    <div className="issue-message">❌ {issue.message}</div>
+                                    {issue.fix && (
+                                      <div className="issue-fix">💡 {issue.fix}</div>
+                                    )}
+                                  </div>
+                                ))}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
                 </div>
               )}
             </div>
@@ -416,147 +336,58 @@ function App() {
         </div>
       )}
 
-      {/* Validate Button */}
-      <div className="action-section">
-        <button
-          className="validate-button"
-          onClick={handleValidate}
-          disabled={files.length === 0 || selectedPlatforms.length === 0 || isValidating}
-        >
-          {isValidating ? 'Validating...' : `Validate ${files.length} Creative(s) Against ${selectedPlatforms.length} Platform(s)`}
-        </button>
-      </div>
-
-      {/* Results */}
-      {validationResults.length > 0 && (
-        <div className="results-section">
-          <h2 className="results-title">Validation Results</h2>
-
-          {/* ERRORS Section (Red) */}
-          {allGrouped.errors.length > 0 && (
-            <div className="severity-section error-section">
-              <div
-                className="severity-header"
-                onClick={() => toggleSection('errors')}
-              >
-                <span className="severity-icon">❌</span>
-                <span className="severity-title">Major Problems</span>
-                <span className="severity-count">{allGrouped.errors.length}</span>
-                <span className="expand-icon">{expandedSections.errors ? '▼' : '▶'}</span>
-              </div>
-              {expandedSections.errors && (
-                <div className="severity-content">
-                  {allGrouped.errors.map((platform, idx) => {
-                    const key = `${platform.fileIndex}-${platform.platformId}`;
-                    const isExpanded = expandedPlatforms[key];
-                    const errorIssues = platform.issues.filter(i => i.severity === SEVERITY.ERROR);
-
-                    return (
-                      <div key={idx} className="result-item">
-                        <div
-                          className="result-header"
-                          onClick={() => togglePlatform(platform.fileIndex, platform.platformId)}
-                        >
-                          <div>
-                            <span className="file-name">{platform.filename}</span>
-                            <span className="platform-badge error-badge">{platform.platformName}</span>
-                          </div>
-                          <span className="issue-count">{errorIssues.length} issue(s)</span>
-                          <span className="expand-icon-small">{isExpanded ? '▼' : '▶'}</span>
-                        </div>
-                        {isExpanded && (
-                          <div className="issues-list">
-                            {errorIssues.map((issue, issueIdx) => (
-                              <div key={issueIdx} className="issue-item error-issue">
-                                <div className="issue-message">{issue.message}</div>
-                                {issue.fix && <div className="issue-fix">💡 {issue.fix}</div>}
-                              </div>
-                            ))}
-                          </div>
-                        )}
-                      </div>
-                    );
-                  })}
+      {/* Demo Modal */}
+      {showDemoModal && (
+        <div className="modal-overlay" onClick={() => setShowDemoModal(false)}>
+          <div className="modal-content" onClick={(e) => e.stopPropagation()}>
+            <h2>🎭 Demo Creative Files</h2>
+            <p className="modal-subtitle">
+              Try these pre-made files to see how the validator works
+            </p>
+            
+            <div className="demo-files-list">
+              <div className="demo-file-item">
+                <span className="demo-file-icon">📱</span>
+                <div className="demo-file-info">
+                  <div className="demo-file-name">tiktok-vertical.mp4</div>
+                  <div className="demo-file-specs">1080x1920, 15s • Vertical video</div>
                 </div>
-              )}
-            </div>
-          )}
-
-          {/* WARNINGS Section (Yellow) */}
-          {allGrouped.warnings.length > 0 && (
-            <div className="severity-section warning-section">
-              <div
-                className="severity-header"
-                onClick={() => toggleSection('warnings')}
-              >
-                <span className="severity-icon">⚠️</span>
-                <span className="severity-title">Minor Adjustments</span>
-                <span className="severity-count">{allGrouped.warnings.length}</span>
-                <span className="expand-icon">{expandedSections.warnings ? '▼' : '▶'}</span>
               </div>
-              {expandedSections.warnings && (
-                <div className="severity-content">
-                  {allGrouped.warnings.map((platform, idx) => {
-                    const key = `${platform.fileIndex}-${platform.platformId}`;
-                    const isExpanded = expandedPlatforms[key];
-                    const warningIssues = platform.issues.filter(i => i.severity === SEVERITY.WARNING);
-
-                    return (
-                      <div key={idx} className="result-item">
-                        <div
-                          className="result-header"
-                          onClick={() => togglePlatform(platform.fileIndex, platform.platformId)}
-                        >
-                          <div>
-                            <span className="file-name">{platform.filename}</span>
-                            <span className="platform-badge warning-badge">{platform.platformName}</span>
-                          </div>
-                          <span className="issue-count">{warningIssues.length} issue(s)</span>
-                          <span className="expand-icon-small">{isExpanded ? '▼' : '▶'}</span>
-                        </div>
-                        {isExpanded && (
-                          <div className="issues-list">
-                            {warningIssues.map((issue, issueIdx) => (
-                              <div key={issueIdx} className="issue-item warning-issue">
-                                <div className="issue-message">{issue.message}</div>
-                                {issue.fix && <div className="issue-fix">💡 {issue.fix}</div>}
-                              </div>
-                            ))}
-                          </div>
-                        )}
-                      </div>
-                    );
-                  })}
+              
+              <div className="demo-file-item">
+                <span className="demo-file-icon">🖼️</span>
+                <div className="demo-file-info">
+                  <div className="demo-file-name">banner-300x250.jpg</div>
+                  <div className="demo-file-specs">300x250 • IAB Standard</div>
                 </div>
-              )}
-            </div>
-          )}
-
-          {/* SUCCESS Section (Green) */}
-          {allGrouped.success.length > 0 && (
-            <div className="severity-section success-section">
-              <div
-                className="severity-header"
-                onClick={() => toggleSection('success')}
-              >
-                <span className="severity-icon">✅</span>
-                <span className="severity-title">Passed / OK</span>
-                <span className="severity-count">{allGrouped.success.length}</span>
-                <span className="expand-icon">{expandedSections.success ? '▼' : '▶'}</span>
               </div>
-              {expandedSections.success && (
-                <div className="severity-content">
-                  {allGrouped.success.map((platform, idx) => (
-                    <div key={idx} className="result-item success-item">
-                      <span className="file-name">{platform.filename}</span>
-                      <span className="platform-badge success-badge">{platform.platformName}</span>
-                      <span className="success-message">All checks passed ✓</span>
-                    </div>
-                  ))}
+              
+              <div className="demo-file-item">
+                <span className="demo-file-icon">📺</span>
+                <div className="demo-file-info">
+                  <div className="demo-file-name">netflix-1080p.mp4</div>
+                  <div className="demo-file-specs">1920x1080, 30s • Streaming</div>
                 </div>
-              )}
+              </div>
+              
+              <div className="demo-file-item">
+                <span className="demo-file-icon">💼</span>
+                <div className="demo-file-info">
+                  <div className="demo-file-name">linkedin-post.jpg</div>
+                  <div className="demo-file-specs">1200x628 • Professional</div>
+                </div>
+              </div>
             </div>
-          )}
+
+            <div className="modal-actions">
+              <button onClick={loadDemoFiles} className="modal-btn-primary">
+                Load Demo Files
+              </button>
+              <button onClick={() => setShowDemoModal(false)} className="modal-btn-secondary">
+                Cancel
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>
