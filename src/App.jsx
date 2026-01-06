@@ -1,14 +1,18 @@
 import React, { useState } from 'react';
 import { PLATFORMS, AD_TYPES, getPlatformsByAdType } from './platformSpecs';
 import { validateCreative, groupBySeverity, SEVERITY } from './validator';
+import { detectPlatforms, getPlatformName, formatConfidence, getConfidenceColor } from './autoDetection';
 import './App.css';
 
 function App() {
   const [selectedAdTypes, setSelectedAdTypes] = useState([]);
   const [selectedPlatforms, setSelectedPlatforms] = useState([]);
   const [files, setFiles] = useState([]);
+  const [filesWithMetadata, setFilesWithMetadata] = useState([]);
+  const [autoDetections, setAutoDetections] = useState([]);
   const [validationResults, setValidationResults] = useState([]);
   const [isValidating, setIsValidating] = useState(false);
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [expandedSections, setExpandedSections] = useState({
     errors: true,
     warnings: false,
@@ -43,9 +47,115 @@ function App() {
     );
   };
 
-  const handleFileChange = (event) => {
+  const handleFileChange = async (event) => {
     const selectedFiles = Array.from(event.target.files);
     setFiles(selectedFiles);
+    setIsAnalyzing(true);
+
+    // Extract metadata and run auto-detection for each file
+    const filesData = [];
+    const allDetections = [];
+
+    for (const file of selectedFiles) {
+      const metadata = await extractMetadata(file);
+      filesData.push({ file, metadata });
+      
+      const detections = detectPlatforms(file, metadata);
+      allDetections.push({
+        filename: file.name,
+        detections
+      });
+    }
+
+    setFilesWithMetadata(filesData);
+    setAutoDetections(allDetections);
+    setIsAnalyzing(false);
+  };
+
+  // Extract metadata from file
+  const extractMetadata = async (file) => {
+    const ext = file.name.split('.').pop().toLowerCase();
+    
+    // Image metadata
+    if (['jpg', 'jpeg', 'png', 'gif'].includes(ext)) {
+      try {
+        const dimensions = await getImageDimensions(file);
+        return dimensions;
+      } catch (error) {
+        return {};
+      }
+    }
+    
+    // Video metadata
+    if (['mp4', 'mov'].includes(ext)) {
+      try {
+        const metadata = await getVideoMetadata(file);
+        return metadata;
+      } catch (error) {
+        return {};
+      }
+    }
+    
+    return {};
+  };
+
+  // Get image dimensions
+  const getImageDimensions = (file) => {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      const url = URL.createObjectURL(file);
+      
+      img.onload = () => {
+        URL.revokeObjectURL(url);
+        resolve({ width: img.width, height: img.height });
+      };
+      
+      img.onerror = () => {
+        URL.revokeObjectURL(url);
+        reject(new Error('Failed to load image'));
+      };
+      
+      img.src = url;
+    });
+  };
+
+  // Get video metadata
+  const getVideoMetadata = (file) => {
+    return new Promise((resolve, reject) => {
+      const video = document.createElement('video');
+      const url = URL.createObjectURL(file);
+      
+      video.onloadedmetadata = () => {
+        URL.revokeObjectURL(url);
+        resolve({
+          width: video.videoWidth,
+          height: video.videoHeight,
+          duration: Math.round(video.duration)
+        });
+      };
+      
+      video.onerror = () => {
+        URL.revokeObjectURL(url);
+        reject(new Error('Failed to load video'));
+      };
+      
+      video.src = url;
+    });
+  };
+
+  // Apply auto-detected platforms
+  const applyAutoDetections = () => {
+    const suggestedPlatforms = new Set();
+    
+    autoDetections.forEach(fileDetection => {
+      fileDetection.detections.forEach(detection => {
+        if (detection.autoSelect && detection.confidence >= 0.75) {
+          suggestedPlatforms.add(detection.platform);
+        }
+      });
+    });
+    
+    setSelectedPlatforms(Array.from(suggestedPlatforms));
   };
 
   const handleValidate = async () => {
@@ -223,6 +333,88 @@ function App() {
           </div>
         </label>
       </div>
+
+      {/* Auto-Detection Results */}
+      {autoDetections.length > 0 && (
+        <div className="auto-detection-section">
+          <div className="section-header">
+            <h2>
+              <span className="brain-icon">🧠</span>
+              Smart Platform Detection
+            </h2>
+            <button 
+              onClick={applyAutoDetections} 
+              className="apply-auto-btn"
+            >
+              Auto-Select All
+            </button>
+          </div>
+
+          {isAnalyzing && (
+            <div className="analyzing-message">
+              Analyzing files...
+            </div>
+          )}
+
+          {!isAnalyzing && autoDetections.map((fileDetection, fileIndex) => (
+            <div key={fileIndex} className="detection-file-card">
+              <div className="detection-file-header">
+                <span className="detection-filename">{fileDetection.filename}</span>
+                {filesWithMetadata[fileIndex]?.metadata.width && (
+                  <span className="detection-metadata">
+                    {filesWithMetadata[fileIndex].metadata.width}x
+                    {filesWithMetadata[fileIndex].metadata.height}
+                    {filesWithMetadata[fileIndex].metadata.duration && 
+                      ` • ${filesWithMetadata[fileIndex].metadata.duration}s`
+                    }
+                  </span>
+                )}
+              </div>
+
+              {fileDetection.detections.length > 0 ? (
+                <div className="detection-platforms">
+                  {fileDetection.detections.slice(0, 5).map((detection, detIndex) => (
+                    <div 
+                      key={detIndex} 
+                      className={`detection-card ${detection.autoSelect ? 'auto-select' : ''}`}
+                      onClick={() => {
+                        if (!selectedPlatforms.includes(detection.platform)) {
+                          setSelectedPlatforms([...selectedPlatforms, detection.platform]);
+                        }
+                      }}
+                    >
+                      <div className="detection-header">
+                        <span className="detection-platform-name">
+                          {detection.autoSelect && '✓ '}
+                          {getPlatformName(detection.platform)}
+                        </span>
+                        <span 
+                          className="detection-confidence"
+                          style={{ color: getConfidenceColor(detection.confidence) }}
+                        >
+                          {formatConfidence(detection.confidence)}
+                        </span>
+                      </div>
+                      <div className="detection-reason">
+                        {detection.reason}
+                      </div>
+                      {detection.warning && (
+                        <div className="detection-warning">
+                          ⚠️ {detection.warning}
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="no-detections">
+                  No automatic platform matches. Please select manually.
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
 
       {/* Validate Button */}
       <div className="action-section">
